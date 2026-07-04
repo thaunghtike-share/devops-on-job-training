@@ -1,414 +1,378 @@
-````markdown
-# Kubernetes Authentication Lab
+# Kubernetes Job & CronJob Lab - PSQL Backup to AWS S3
 
-## Create a Developer Kubeconfig with Access to dev and uat Namespaces
+## Goal
 
-## Objectives
+Create a PostgreSQL database in Kubernetes, then back it up to AWS S3.
 
-In this lab, you will learn:
+The backup flow is:
 
-- Create a Kubernetes user using Client Certificates
-- Generate a Private Key
-- Generate a Certificate Signing Request (CSR)
-- Sign a Certificate using the Kubernetes CA
-- Create a Developer kubeconfig
-- Test Authentication
-- Grant permissions using RBAC
-- Verify namespace access
+1. One container runs `pg_dump`.
+2. The same container uploads the backup file to S3.
+
+The Job and CronJob use the same logic.
 
 ---
 
-# 1. Generate Developer Private Key
+# 1. Set AWS Values
+
+Do not write real AWS keys into YAML files.
 
 ```bash
-openssl genrsa -out developer.key 2048
+export AWS_ACCESS_KEY_ID="<ACCESS_KEY_ID>"
+export AWS_SECRET_ACCESS_KEY="<SECRET_ACCESS_KEY>"
+export AWS_DEFAULT_REGION="ap-southeast-1"
+export S3_BUCKET="psql-backup-demo-$(date +%s)"
 ```
 
-Verify
+Create the S3 bucket:
 
 ```bash
-ls -l developer.key
+aws s3api create-bucket \
+  --bucket "$S3_BUCKET" \
+  --region "$AWS_DEFAULT_REGION" \
+  --create-bucket-configuration LocationConstraint="$AWS_DEFAULT_REGION"
 ```
 
----
-
-# 2. Generate Certificate Signing Request
+Check:
 
 ```bash
-openssl req -new \
-  -key developer.key \
-  -out developer.csr \
-  -subj "/CN=developer/O=developers"
-```
-
-Verify
-
-```bash
-openssl req -text -noout -in developer.csr
-```
-
-Expected
-
-```text
-Subject:
-    CN = developer
-    O = developers
+aws s3 ls "s3://$S3_BUCKET"
 ```
 
 ---
 
-# 3. Sign the Certificate using Kubernetes CA
-
-Run this on the control-plane node.
+# 2. Create Namespaces
 
 ```bash
-sudo openssl x509 \
-  -req \
-  -in developer.csr \
-  -CA /etc/kubernetes/pki/ca.crt \
-  -CAkey /etc/kubernetes/pki/ca.key \
-  -CAcreateserial \
-  -out developer.crt \
-  -days 365
-```
-
-Verify
-
-```bash
-openssl x509 -text -noout -in developer.crt
-```
-
-Expected
-
-```text
-Subject:
-    CN = developer
-    O = developers
-
-Issuer:
-    Kubernetes CA
+kubectl create namespace database
+kubectl create namespace backup
 ```
 
 ---
 
-# 4. Get the Kubernetes API Server Address
+# 3. Create PSQL Secret
+
+Secret name: `psql`
 
 ```bash
-API_SERVER=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
-
-echo $API_SERVER
-```
-
----
-
-# 5. Create Developer kubeconfig
-
-Create the cluster entry.
-
-```bash
-kubectl config set-cluster kubernetes \
-  --server=$API_SERVER \
-  --certificate-authority=/etc/kubernetes/pki/ca.crt \
-  --embed-certs=true \
-  --kubeconfig=developer.conf
-```
-
-Create the user entry.
-
-```bash
-kubectl config set-credentials developer \
-  --client-certificate=developer.crt \
-  --client-key=developer.key \
-  --embed-certs=true \
-  --kubeconfig=developer.conf
-```
-
-Create the context.
-
-```bash
-kubectl config set-context developer-context \
-  --cluster=kubernetes \
-  --user=developer \
-  --kubeconfig=developer.conf
-```
-
-Use the context.
-
-```bash
-kubectl config use-context developer-context \
-  --kubeconfig=developer.conf
-```
-
-Verify
-
-```bash
-kubectl config view --kubeconfig=developer.conf
-```
-
----
-
-# 6. Test Authentication
-
-```bash
-kubectl --kubeconfig=developer.conf get pods
-```
-
-Expected
-
-```text
-Error from server (Forbidden)
-```
-
-Authentication is successful.
-
-Authorization has not been configured yet.
-
----
-
-# 7. Create Namespaces
-
-```bash
-kubectl create namespace dev
-
-kubectl create namespace uat
-```
-
-Verify
-
-```bash
-kubectl get ns
-```
-
----
-
-# 8. Create Role for dev Namespace
-
-Create
-
-```bash
-vim dev-role.yaml
-```
-
-```yaml
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
+cat > psql-secret.yaml <<'EOF'
+apiVersion: v1
+kind: Secret
 metadata:
-  name: developer-full-access
-  namespace: dev
-rules:
-- apiGroups: ["*"]
-  resources: ["*"]
-  verbs: ["*"]
-```
+  name: psql
+  namespace: database
+type: Opaque
+stringData:
+  POSTGRES_USER: admin
+  POSTGRES_PASSWORD: password123
+  POSTGRES_DB: app
+EOF
 
-Apply
-
-```bash
-kubectl apply -f dev-role.yaml
+kubectl apply -f psql-secret.yaml
 ```
 
 ---
 
-# 9. Create RoleBinding for dev
+# 4. Create PSQL Database
 
-Create
+File: `psql.yaml`
 
 ```bash
-vim dev-rolebinding.yaml
-```
-
-```yaml
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
+cat > psql.yaml <<'EOF'
+apiVersion: v1
+kind: Service
 metadata:
-  name: developer-binding
-  namespace: dev
-subjects:
-- kind: User
-  name: developer
-  apiGroup: rbac.authorization.k8s.io
-
-roleRef:
-  kind: Role
-  name: developer-full-access
-  apiGroup: rbac.authorization.k8s.io
-```
-
-Apply
-
-```bash
-kubectl apply -f dev-rolebinding.yaml
-```
-
-# 10. Test Access to dev
-
-```bash
-kubectl --kubeconfig=developer.conf get pods -n dev
-```
-
-Create a Pod.
-
-```bash
-kubectl --kubeconfig=developer.conf run nginx-dev \
-  --image=nginx \
-  -n dev
-```
-
-Verify
-
-```bash
-kubectl --kubeconfig=developer.conf get pods -n dev
-```
-
+  name: psql
+  namespace: database
+spec:
+  selector:
+    app: psql
+  ports:
+    - port: 5432
+      targetPort: 5432
 ---
-
-# 11. Create Role for uat Namespace
-
-Create
-
-```bash
-vim uat-role.yaml
-```
-
-```yaml
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
+apiVersion: apps/v1
+kind: StatefulSet
 metadata:
-  name: developer-full-access
-  namespace: uat
-rules:
-- apiGroups: ["*"]
-  resources: ["*"]
-  verbs: ["*"]
-```
+  name: psql
+  namespace: database
+spec:
+  serviceName: psql
+  replicas: 1
+  selector:
+    matchLabels:
+      app: psql
+  template:
+    metadata:
+      labels:
+        app: psql
+    spec:
+      containers:
+        - name: psql
+          image: postgres:16.1
+          envFrom:
+            - secretRef:
+                name: psql
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        resources:
+          requests:
+            storage: 5Gi
+EOF
 
-Apply
-
-```bash
-kubectl apply -f uat-role.yaml
+kubectl apply -f psql.yaml
+kubectl rollout status statefulset/psql -n database
 ```
 
 ---
 
-# 12. Create RoleBinding for uat
+# 5. Insert Sample Data
 
-Create
+Open PSQL:
 
 ```bash
-vim uat-rolebinding.yaml
+kubectl exec -it psql-0 -n database -- psql -U admin -d app
 ```
 
-```yaml
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
+Run SQL:
+
+```sql
+CREATE TABLE users (
+  id SERIAL PRIMARY KEY,
+  name TEXT
+);
+
+INSERT INTO users(name) VALUES ('Mg Mg'), ('Aung Aung');
+
+SELECT * FROM users;
+
+\q
+```
+
+---
+
+# 6. Create AWS Secret
+
+Secret name: `aws`
+
+```bash
+kubectl create secret generic aws \
+  -n backup \
+  --from-literal=AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
+  --from-literal=AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" \
+  --from-literal=AWS_DEFAULT_REGION="$AWS_DEFAULT_REGION" \
+  --from-literal=S3_BUCKET="$S3_BUCKET"
+```
+
+---
+
+# 7. Backup Job
+
+File: `psql-backup-job.yaml`
+
+```bash
+cat > psql-backup-job.yaml <<'EOF'
+apiVersion: batch/v1
+kind: Job
 metadata:
-  name: developer-binding
-  namespace: uat
-subjects:
-- kind: User
-  name: developer
-  apiGroup: rbac.authorization.k8s.io
+  name: psql-backup
+  namespace: backup
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: backup
+          image: postgres:16.1
+          envFrom:
+            - secretRef:
+                name: aws
+          env:
+            - name: DB_HOST
+              value: psql.database.svc.cluster.local
+            - name: DB_PORT
+              value: "5432"
+            - name: DB_USER
+              value: admin
+            - name: PGPASSWORD
+              value: password123
+            - name: DB_NAME
+              value: app
+          command:
+            - sh
+            - -c
+            - |
+              apt-get update
+              apt-get install -y awscli
 
-roleRef:
-  kind: Role
-  name: developer-full-access
-  apiGroup: rbac.authorization.k8s.io
+              DATE=$(date +%Y-%m-%d-%H-%M-%S)
+              FILE="/tmp/app-${DATE}.sql.gz"
+
+              pg_dump \
+                -h "$DB_HOST" \
+                -p "$DB_PORT" \
+                -U "$DB_USER" \
+                -d "$DB_NAME" \
+                | gzip > "$FILE"
+
+              aws s3 cp \
+                "$FILE" \
+                "s3://$S3_BUCKET/psql/job/app-${DATE}.sql.gz"
+EOF
+
+kubectl apply -f psql-backup-job.yaml
 ```
 
-Apply
+Check:
 
 ```bash
-kubectl apply -f uat-rolebinding.yaml
+kubectl get pods -n backup
+kubectl logs -f job/psql-backup -n backup
+aws s3 ls "s3://$S3_BUCKET/psql/job/"
 ```
 
-# 13. Test Access to uat
+Retry:
 
 ```bash
-kubectl --kubeconfig=developer.conf get pods -n uat
-```
-
-Create a Pod.
-
-```bash
-kubectl --kubeconfig=developer.conf run nginx-uat \
-  --image=nginx \
-  -n uat
-```
-
-Verify
-
-```bash
-kubectl --kubeconfig=developer.conf get pods -n uat
+kubectl delete job psql-backup -n backup
+kubectl apply -f psql-backup-job.yaml
 ```
 
 ---
 
-# 14. Verify Access to default Namespace
+# 8. Backup CronJob
+
+File: `psql-backup-cronjob.yaml`
 
 ```bash
-kubectl --kubeconfig=developer.conf get pods -n default
+cat > psql-backup-cronjob.yaml <<'EOF'
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: psql-backup
+  namespace: backup
+spec:
+  schedule: "*/3 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: backup
+              image: postgres:16.1
+              envFrom:
+                - secretRef:
+                    name: aws
+              env:
+                - name: DB_HOST
+                  value: psql.database.svc.cluster.local
+                - name: DB_PORT
+                  value: "5432"
+                - name: DB_USER
+                  value: admin
+                - name: PGPASSWORD
+                  value: password123
+                - name: DB_NAME
+                  value: app
+              command:
+                - sh
+                - -c
+                - |
+                  apt-get update
+                  apt-get install -y awscli
+
+                  DATE=$(date +%Y-%m-%d-%H-%M-%S)
+                  FILE="/tmp/app-${DATE}.sql.gz"
+
+                  pg_dump \
+                    -h "$DB_HOST" \
+                    -p "$DB_PORT" \
+                    -U "$DB_USER" \
+                    -d "$DB_NAME" \
+                    | gzip > "$FILE"
+
+                  aws s3 cp \
+                    "$FILE" \
+                    "s3://$S3_BUCKET/psql/cronjob/app-${DATE}.sql.gz"
+EOF
+
+kubectl apply -f psql-backup-cronjob.yaml
 ```
 
-Expected
+Check:
 
-```text
-Error from server (Forbidden)
+```bash
+kubectl get cronjob -n backup
+kubectl get jobs -n backup
+aws s3 ls "s3://$S3_BUCKET/psql/cronjob/"
 ```
 
 ---
 
-# 15. Share kubeconfig to the Developer 
-
-copy it to the default kubeconfig location.
+# 9. Run CronJob Manually
 
 ```bash
-mkdir -p ~/.kube
-
-cp developer.conf ~/.kube/config
+kubectl create job \
+  --from=cronjob/psql-backup \
+  psql-backup-manual \
+  -n backup
 ```
 
-Verify
+Check:
 
 ```bash
-kubectl get pods -n dev
-```
-
----
-
-# 16. Cleanup
-
-```bash
-kubectl delete pod nginx-dev -n dev
-
-kubectl delete pod nginx-uat -n uat
-```
-
-```bash
-kubectl delete rolebinding developer-binding -n dev
-kubectl delete role developer-full-access -n dev
-
-kubectl delete rolebinding developer-binding -n uat
-kubectl delete role developer-full-access -n uat
-```
-
-```bash
-rm developer.key
-rm developer.csr
-rm developer.crt
-rm developer.conf
+kubectl get jobs -n backup
+kubectl logs job/psql-backup-manual -n backup
 ```
 
 ---
 
-# Summary
+# 10. Suspend CronJob
 
-In this lab, you learned:
+```bash
+kubectl patch cronjob psql-backup \
+  -n backup \
+  -p '{"spec":{"suspend":true}}'
+```
 
-- Generate a Client Certificate
-- Create a Kubernetes user identity
-- Build a kubeconfig
-- Authenticate to the Kubernetes API Server
-- Grant namespace permissions using RBAC
-- Restrict a user to specific namespaces
-- Verify Authentication and Authorization
-````
+---
+
+# 11. Resume CronJob
+
+```bash
+kubectl patch cronjob psql-backup \
+  -n backup \
+  -p '{"spec":{"suspend":false}}'
+```
+
+---
+
+# 12. Cleanup
+
+```bash
+kubectl delete namespace backup
+kubectl delete namespace database
+
+aws s3 rm "s3://$S3_BUCKET" --recursive
+aws s3api delete-bucket \
+  --bucket "$S3_BUCKET" \
+  --region "$AWS_DEFAULT_REGION"
+```
