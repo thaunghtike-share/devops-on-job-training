@@ -1,174 +1,153 @@
-# Kubernetes Day 3 Lab
-## Deployment, ReplicaSet, Scaling, Rolling Update, ClusterIP Service, NodePort Service, Selector Testing
+# Kubernetes Deployment and Service Lab
 
-This lab does not include DaemonSet. DaemonSet will be used in Day 4.
+## Deployment
 
----
-
-## Lab Files
-
-- `01-nginx-deployment.yaml`
-- `02-nginx-clusterip-service.yaml`
-- `03-nginx-nodeport-service.yaml`
-- `04-nginx-deployment-v2.yaml`
-
----
-
-## 1. Create Deployment
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-deployment
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.25.5
+          ports:
+            - containerPort: 80
+```
 
 ```bash
-alias k="microk8s kubectl"
-k apply -f 01-nginx-deployment.yaml
-k get deployment
-k get pods
-k get pods --show-labels
-k get rs
+vim nginx-deployment.yaml
+kubectl apply -f nginx-deployment.yaml
+kubectl get deployment
+kubectl get pods --show-labels
+kubectl get rs
 ```
 
-Check that all Pods have this label:
+## Rolling Update
 
-```text
-app=nginx
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-deployment
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:latest
+          ports:
+            - containerPort: 80
 ```
-
----
-
-## 2. Check ReplicaSet
 
 ```bash
-k get rs
-k describe deployment nginx-deployment
+vim nginx-deployment.yaml
+kubectl apply -f nginx-deployment.yaml
+watch kubectl get pods
+kubectl describe deployment nginx-deployment
 ```
-
-Deployment creates ReplicaSet. ReplicaSet maintains the desired Pod count.
-
----
-
-## 3. Create ClusterIP Service
 
 ```bash
-k apply -f 02-nginx-clusterip-service.yaml
-k get svc
-k describe svc nginx-clusterip
-k get pods -o wide 
+kubectl create deployment nginx-imperative --image=nginx:latest --replicas=2
+
+kubectl get deployments
+kubectl get pods
+kubectl get rs
+
+kubectl scale deployment nginx-imperative --replicas=4
+
+kubectl delete deployment nginx-imperative
 ```
 
-Check this section in service describe output:
+## ClusterIP Service
 
-```text
-Selector: app=nginx
-Endpoints: <Pod IPs>
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-clusterip
+spec:
+  type: ClusterIP
+  selector:
+    app: nginx
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 80
 ```
-
-The Service uses selector `app=nginx` to find matching Pods.
-
----
-
-## 4. Test ClusterIP Service with Debug Pod
-
-ClusterIP cannot be accessed directly from outside the cluster.
-
-Create a temporary debug Pod imperatively:
 
 ```bash
-k run tester --image=busybox --restart=Never -- sleep 3600
-k get pods
-k get svc
+vim nginx-clusterip.yaml
+kubectl apply -f nginx-clusterip.yaml
+kubectl get svc
+kubectl describe svc nginx-clusterip
+kubectl get pods -o wide
 ```
 
-Enter the tester Pod:
+## ClusterIP Test
 
 ```bash
-k exec -it tester -- sh
-```
-
-Test ClusterIP Service by DNS name:
-
-```bash
-wget -qO- http://nginx-clusterip
-```
-
-Exit tester Pod:
-
-```bash
+kubectl run tester --image=busybox --restart=Never -- sleep 3600
+kubectl get pods
+kubectl exec -it tester -- sh
+wget -qO- http://10.152.183.189 
+wget -qO- http://nginx-clusterip.default.svc
+kubectl delete pod tester --force
 exit
 ```
 
----
+## NodePort Service
 
-## 5. Create NodePort Service
-
-```bash
-k apply -f 03-nginx-nodeport-service.yaml
-k get svc
-k describe svc nginx-nodeport
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-nodeport
+spec:
+  type: NodePort
+  selector:
+    app: nginx
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 80
+      nodePort: 30080
 ```
 
-Access from outside using Node IP and NodePort:
-
 ```bash
+vim nginx-nodeport.yaml
+kubectl apply -f nginx-nodeport.yaml
+kubectl get svc
+kubectl describe svc nginx-nodeport
 curl http://<NODE_IP>:30080
 ```
 
-For MicroK8s single-node VM, get node IP:
+## Scale
 
 ```bash
-k get nodes -o wide
+kubectl scale deployment nginx-deployment --replicas=6
+kubectl get pods
+kubectl get rs
 ```
 
-Then use:
+## Clean Up
 
 ```bash
-curl http://<NODE_INTERNAL_IP>:30080
-```
-
----
-
-## 6. Scale Out Deployment
-
-```bash
-k scale deployment nginx-deployment --replicas=6
-k get pods
-k get rs
-k describe svc nginx-clusterip
-```
-
-Service endpoints should increase because new Pods also have label:
-
-```text
-app=nginx
-```
-
----
-
-## 7. Imperative 
-k delete all --all --force
-k create deployment nginx-imperative --image=nginx
-k get deployment
-k get pods
-k get rs
-k expose deployment nginx-imperative --port=80 --target-port=80
-k get svc
-k describe svc nginx-imperative
-
-## 8. Scale Deployment
-
-```bash
-k edit deployment nginx-imperative 
-k scale deployment nginx-imperative --replicas=5
-k get pods
-```
-
----
-
-## 9. Clean Up
-
-```bash
-k delete all --all --force
-
-or
-
-k delete deployment --all --force
-k delete service --all --force
-k get all
+kubectl delete all --all --force
 ```
